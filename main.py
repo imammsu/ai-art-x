@@ -1,19 +1,20 @@
+import json
 import re
 from collections import Counter
 from pathlib import Path
 
+import joblib
 import matplotlib.pyplot as plt
 import nltk
 import numpy as np
 import pandas as pd
+import sklearn
 import streamlit as st
 from matplotlib.colors import LinearSegmentedColormap
 from nltk.corpus import stopwords
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_absolute_error, pairwise_distances, r2_score, silhouette_score
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import pairwise_distances, silhouette_score
 
 st.set_page_config(page_title="Dashboard Analisis AI Kreatif", layout="wide")
 
@@ -26,6 +27,7 @@ plt.rcParams.update({'axes.spines.top': False, 'axes.spines.right': False,
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / 'datas'
 
+
 def cari_berkas(nama):
     """Cari di datas/ dulu, lalu di folder app.py."""
     for p in (DATA_DIR / nama, BASE_DIR / nama):
@@ -33,17 +35,21 @@ def cari_berkas(nama):
             return p
     return DATA_DIR / nama      # tidak ada: pesan error memakai path ini
 
+
 PATH_DATA = cari_berkas('dataset_hasil.csv')
 PATH_RINGKASAN = cari_berkas('ringkasan_cluster.csv')
 PATH_EVAL = cari_berkas('evaluasi_sentimen.csv')
 PATH_STOPWORDS = cari_berkas('stopwords.txt')
 PATH_TAHAP = cari_berkas('jumlah_data_per_tahap.csv')
+PATH_MODEL = cari_berkas('model_regresi.joblib')
+PATH_PARAM = cari_berkas('parameter_model.json')
+PATH_UJI = cari_berkas('prediksi_data_uji.csv')
 
 INFO_PENGAMBILAN = {
     'Sumber': 'Platform X, dikumpulkan dengan tweet-harvest (Google Colab)',
     'Kata kunci': 'ilustrator ai, hak cipta ai, seniman ai, penulis ai, desainer ai, musisi ai',
     'Penyaringan periode': '2025-01-01 s.d. 2026-10-11 (kolom created_at)',
-    'Waktu pengambilan': 'ISI sesuai catatan crawling kelompok (sertakan zona waktu)',   # ✏️
+    'Waktu pengambilan': 'ISI sesuai catatan crawling kelompok (sertakan zona waktu)',   # ✏️ wajib diisi
 }
 
 KOLOM_WAJIB = ['text', 'created_at', 'like_count']
@@ -55,8 +61,12 @@ NAMA_TEMA = {
     1: 'Dampak AI bagi Seniman, Musisi, dan Desainer: Kritik dan Kekhawatiran',
     2: 'Tuduhan dan Deteksi Karya Buatan AI pada Penulis dan Ilustrator',
 }
-FITUR = ['jumlah_kata', 'jumlah_hashtag']
-FITUR_ENG = ['retweet_count', 'reply_count']
+NAMA_FITUR = {
+    'like_count': 'Jumlah likes', 'retweet_count': 'Jumlah retweet', 'reply_count': 'Jumlah reply',
+    'jumlah_kata': 'Jumlah kata', 'jumlah_hashtag': 'Jumlah hashtag', 'panjang_karakter': 'Panjang karakter',
+    'jumlah_mention': 'Jumlah mention', 'ada_url': 'Ada tautan (0/1)', 'balasan': 'Postingan balasan (0/1)',
+    'usia_hari': 'Usia postingan (hari)', 'sent_polaritas': 'Skor sentimen (-1 s.d. 1)',
+}
 RANDOM_STATE = 42
 
 STOPWORDS_TAMBAHAN = [
@@ -94,6 +104,7 @@ def muat_stopwords():
             pass
     return sorted(set(dasar) | set(STOPWORDS_TAMBAHAN)), len(dasar) > 0
 
+
 @st.cache_data(show_spinner=False)
 def baca_csv(isi: bytes) -> pd.DataFrame:
     """Baca CSV (tahan BOM dan pemisah ';' atau ',')."""
@@ -113,6 +124,7 @@ def baca_opsional(path: Path):
         st.warning(f"Berkas {path.name} tidak dapat dibaca: {e}")
         return None
 
+
 def ringkas_evaluasi():
     ev = baca_opsional(PATH_EVAL)
     if ev is None:
@@ -127,6 +139,7 @@ def ringkas_evaluasi():
         return None
     vc = a.value_counts()
     return {'n': n, 'k': int((a == b).sum()), 'kelas': vc.index[0], 'dasar': vc.iloc[0] / n * 100}
+
 
 def wilson(k, n, z=1.96):
     if n == 0:
@@ -180,6 +193,16 @@ def kesesuaian_query(dc):
     return float(ct.max(axis=1).mean() * 100)
 
 
+def baris_regresi(df):
+    """Rincian baris data yang valid untuk regresi (likes valid dan teks tidak kosong)."""
+    like = pd.to_numeric(df['like_count'], errors='coerce')
+    tidak_valid = like.isna() | (like < 0)
+    kosong = df['text'].fillna('').astype(str).str.strip() == ''
+    return {'dipakai': int((~tidak_valid & ~kosong).sum()),
+            'like_tidak_valid': int(tidak_valid.sum()),
+            'teks_kosong': int((kosong & ~tidak_valid).sum())}
+
+
 # ==========================================================
 # ANALISIS (di-cache)
 # ==========================================================
@@ -228,83 +251,99 @@ def buat_wordcloud(teks: tuple, sentimen: tuple, stop: tuple):
     return hasil
 
 
-@st.cache_data(show_spinner='Melatih model regresi...')
-def latih_regresi(data: pd.DataFrame):
-    """Prosedur sama dengan notebook: fitur dari teks asli, 80/20, random_state=42, latih hanya di data latih."""
-    d = data.copy()
-    d['text'] = d['text'].fillna('').astype(str)
-    d['like_count'] = pd.to_numeric(d['like_count'], errors='coerce')
-    n_awal = len(d)
+@st.cache_resource(show_spinner=False)
+def muat_regresi():
+    """Memuat hasil regresi dari notebook.
+    Prioritas: model_regresi.joblib. Cadangan: parameter_model.json (+ prediksi_data_uji.csv).
+    Hanya muat berkas buatan sendiri (joblib/pickle dapat menjalankan kode)."""
+    hasil = {'p': None, 'objek': {}, 'uji': None, 'versi_model': None, 'catatan': []}
+    kunci = ('meta', 'seleksi_fitur', 'model_utama', 'pembanding_dasar', 'model_ketentuan')
 
-    tidak_valid = d['like_count'].isna() | (d['like_count'] < 0)
-    n_like_tidak_valid = int(tidak_valid.sum())
-    d = d[~tidak_valid]
-    kosong = d['text'].str.strip() == ''
-    n_teks_kosong = int(kosong.sum())
-    d = d[~kosong].reset_index(drop=True)          # likes tidak diketahui TIDAK diganti 0
-    if len(d) < 20:
-        return {'ok': False, 'pesan': f'Data valid hanya {len(d)} baris (minimal 20 untuk membagi data latih/uji).',
-                'n_awal': n_awal, 'n_like_tidak_valid': n_like_tidak_valid, 'n_teks_kosong': n_teks_kosong}
-
-    d['jumlah_kata'] = d['text'].str.split().str.len()
-    d['jumlah_hashtag'] = d['text'].str.count(r'#\w+')
-    X, y = d[FITUR], d['like_count']
-    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=RANDOM_STATE)
-
-    model = LinearRegression().fit(X_tr, y_tr)
-    y_pred = model.predict(X_te)
-
-    r = {
-        'ok': True, 'n_awal': n_awal, 'n_like_tidak_valid': n_like_tidak_valid, 'n_teks_kosong': n_teks_kosong,
-        'n_pakai': len(d), 'n_latih': len(X_tr), 'n_uji': len(X_te),
-        'model': model, 'intercept': float(model.intercept_), 'coef': [float(c) for c in model.coef_],
-        'mae': float(mean_absolute_error(y_te, y_pred)), 'r2': float(r2_score(y_te, y_pred)),
-        'mae_rata': float(mean_absolute_error(y_te, np.full(len(y_te), y_tr.mean()))),
-        'mae_median': float(mean_absolute_error(y_te, np.full(len(y_te), y_tr.median()))),
-        'median_uji': float(y_te.median()), 'median_semua': float(y.median()),
-        'n_negatif': int((y_pred < 0).sum()),
-        'y_test': y_te.to_numpy(), 'y_pred': y_pred, 'X_test': X_te.reset_index(drop=True),
-        'kata_median': int(d['jumlah_kata'].median()), 'kata_min': int(d['jumlah_kata'].min()),
-        'kata_max': int(d['jumlah_kata'].max()), 'hashtag_max': int(d['jumlah_hashtag'].max()),
-        'persen_berhashtag': float((d['jumlah_hashtag'] > 0).mean() * 100),
-        'data_latih': pd.concat([X_tr, y_tr], axis=1),
-        'eks': None,
-        'teks_uji': d.loc[X_te.index, 'text'].tolist(),
-        'deskripsi': d[FITUR + ['like_count']].describe().round(2),
-        'sebaran_hashtag': d['jumlah_hashtag'].value_counts().sort_index(),
-        'n_hashtag_latih': int((X_tr['jumlah_hashtag'] > 0).sum()),
-    }
-    r['est_tipikal'] = float(model.predict(pd.DataFrame([[r['kata_median'], 0]], columns=FITUR))[0])
-
-    # model tambahan (cell 63 notebook): retweet + reply -> likes, skala asli,
-    # baris latih/uji SAMA dengan model utama
-    if all(k in d.columns for k in FITUR_ENG):
-        d[FITUR_ENG] = d[FITUR_ENG].apply(pd.to_numeric, errors='coerce')
-    if all(k in d.columns for k in FITUR_ENG) and d[FITUR_ENG].notna().all().all():
-        X2_tr, X2_te = d.loc[X_tr.index, FITUR_ENG], d.loc[X_te.index, FITUR_ENG]
-        m2 = LinearRegression().fit(X2_tr, y_tr)
-        p2 = m2.predict(X2_te)
-        r['eks'] = {'model': m2, 'mae': float(mean_absolute_error(y_te, p2)), 'r2': float(r2_score(y_te, p2)),
-                    'intercept': float(m2.intercept_), 'coef': [float(c) for c in m2.coef_],
-                    'n_negatif': int((p2 < 0).sum()), 'y_pred': p2,
-                    'X_test': X2_te.reset_index(drop=True),
-                    'data_latih': pd.concat([X2_tr, y_tr], axis=1),
-                    'deskripsi': d[FITUR_ENG + ['like_count']].describe().round(2),
-                    'maks': {k: int(d[k].max()) for k in FITUR_ENG},
-                    'median': {k: float(d[k].median()) for k in FITUR_ENG}}
-    return r
+    if PATH_MODEL.exists():
+        try:
+            bundel = joblib.load(PATH_MODEL)
+            hasil['p'] = {k: bundel[k] for k in kunci if k in bundel}
+            hasil['objek'] = bundel.get('objek_model') or {}
+            hasil['versi_model'] = bundel.get('versi_sklearn')
+            if bundel.get('uji') is not None:
+                hasil['uji'] = pd.DataFrame(bundel['uji'])
+        except Exception as e:
+            hasil['catatan'].append(f"{PATH_MODEL.name} tidak dapat dimuat ({type(e).__name__}); "
+                                    "memakai parameter_model.json bila tersedia.")
+    if hasil['p'] is None and PATH_PARAM.exists():
+        try:
+            hasil['p'] = json.loads(PATH_PARAM.read_text(encoding='utf-8'))
+        except Exception as e:
+            hasil['catatan'].append(f"{PATH_PARAM.name} tidak dapat dibaca ({type(e).__name__}).")
+    if hasil['uji'] is None and PATH_UJI.exists():
+        try:
+            hasil['uji'] = pd.read_csv(PATH_UJI)
+        except Exception:
+            pass
+    wajib = {'meta', 'seleksi_fitur', 'model_utama', 'pembanding_dasar'}
+    if hasil['p'] is not None and not wajib.issubset(hasil['p']):
+        hasil['catatan'].append("Berkas hasil regresi tidak lengkap; jalankan ulang sel ekspor di notebook.")
+        hasil['p'] = None
+    return hasil
 
 
-def hasil_regresi(df):
-    kolom = ['text', 'like_count'] + [k for k in FITUR_ENG if k in df.columns]
-    return latih_regresi(df[kolom])
+def estimasi(blok, nilai, model=None):
+    """Pakai objek model bila ada; jika tidak, hitung dari intersep + koefisien (hasilnya sama)."""
+    if model is not None:
+        x = pd.DataFrame([[nilai[f] for f in blok['fitur']]], columns=blok['fitur'])
+        return float(model.predict(x)[0])
+    return float(blok['intercept'] + sum(c * nilai[f] for f, c in zip(blok['fitur'], blok['koefisien'])))
+
+
+def gambar_heatmap_param(sel):
+    label, mat = sel['label_heatmap'], np.array(sel['matriks_heatmap'])
+    fig, ax = plt.subplots(figsize=(9, 7.5))
+    img = ax.imshow(mat, cmap='RdBu_r', vmin=-1, vmax=1)
+    n = len(label)
+    ax.set_xticks(range(n))
+    ax.set_yticks(range(n))
+    ax.set_xticklabels(label, rotation=40, ha='right')
+    ax.set_yticklabels(label)
+    for i in range(n):
+        for j in range(n):
+            ax.text(j, i, f'{mat[i, j]:.2f}', ha='center', va='center', fontsize=8,
+                    color='white' if abs(mat[i, j]) > 0.6 else '#2c2c2a')
+    ax.grid(False)
+    ax.set_title('Korelasi linear (Pearson), data latih', fontsize=11)
+    fig.colorbar(img, ax=ax, shrink=0.8, label='Koefisien korelasi Pearson')
+    plt.tight_layout()
+    return fig
+
+
+def form_estimasi(blok, model, kunci):
+    """Formulir estimasi likes untuk satu model (fitur mengikuti blok['fitur'])."""
+    with st.form(f"form_{kunci}"):
+        nilai = {}
+        for kol, f, lab in zip(st.columns(len(blok['fitur'])), blok['fitur'], blok['label_fitur']):
+            rg = blok['rentang'][f]
+            if all(float(rg[x]).is_integer() for x in ('min', 'maks', 'median')):
+                nilai[f] = kol.number_input(lab, min_value=int(rg['min']), value=int(rg['median']),
+                                            step=1, key=f"{kunci}_{f}")
+            else:
+                nilai[f] = kol.number_input(lab, min_value=float(rg['min']), value=float(rg['median']),
+                                            step=0.01, key=f"{kunci}_{f}")
+        kirim = st.form_submit_button("Hitung estimasi")
+    if kirim:
+        est = estimasi(blok, nilai, model)
+        st.metric("Estimasi likes (nilai mentah model)", f"{est:,.1f}")
+        if est < 0:
+            st.warning("Estimasi negatif tidak bermakna sebagai jumlah likes. Ini menunjukkan keterbatasan model linear.")
+        luar = [lab for f, lab in zip(blok['fitur'], blok['label_fitur']) if nilai[f] > blok['rentang'][f]['maks']]
+        if luar:
+            st.warning("Masukan di luar rentang data untuk: " + ", ".join(luar) + ". Estimasi tidak andal.")
+        st.caption("Estimasi ini hanya ilustrasi, bukan prediksi yang dapat diandalkan.")
 
 
 # ==========================================================
-# PEMUATAN DATA (dipakai semua halaman)
+# PEMUATAN DATA (dipakai semua tab)
 # ==========================================================
 def widget_unggah():
-    """Unggah CSV di halaman Dataset; isinya disimpan di session_state agar halaman lain ikut memakainya."""
+    """Unggah CSV di tab Data; isinya disimpan di session_state agar tab lain ikut memakainya."""
     with st.expander("Ganti sumber data (opsional)"):
         unggah = st.file_uploader("Unggah CSV hasil notebook. Jika kosong, memakai datas/dataset_hasil.csv",
                                   type=['csv'])
@@ -316,24 +355,23 @@ def widget_unggah():
 
 
 def muat_data():
-    """Mengembalikan (df, nama_berkas, tabel_cek_kolom). df = None bila data tidak valid."""
+    """Mengembalikan (df, nama_berkas, tabel_cek_kolom, tweet_url_dibuang). df = None bila data tidak valid."""
     if 'unggahan' in st.session_state:
         nama, isi = st.session_state['unggahan']
     elif PATH_DATA.exists():
         isi, nama = PATH_DATA.read_bytes(), PATH_DATA.name
     else:
-        st.error(f"Berkas {PATH_DATA.name} tidak ditemukan di folder datas/. Letakkan berkas itu atau unggah CSV "
-                 "di halaman Dataset.")
-        return None, None, None
+        st.error(f"Berkas {PATH_DATA.name} tidak ditemukan di folder datas/. Letakkan berkas itu atau unggah CSV.")
+        return None, None, None, False
 
     try:
         mentah = baca_csv(isi)
     except Exception as e:
         st.error(f"CSV tidak dapat dibaca: {e}")
-        return None, nama, None
+        return None, nama, None, False
     if mentah.empty:
         st.error("CSV tidak berisi baris data.")
-        return None, nama, None
+        return None, nama, None, False
 
     # pemeriksaan kolom wajib
     cek = pd.DataFrame({'Kolom wajib': KOLOM_WAJIB,
@@ -342,33 +380,33 @@ def muat_data():
     if kurang:
         st.error(f"Kolom wajib tidak ditemukan: {kurang}. Aplikasi tidak dapat memproses data ini.")
         st.dataframe(cek, hide_index=True)
-        return None, nama, cek
+        return None, nama, cek, False
 
     df = mentah.copy()
-    if 'tweet_url' in df.columns:
+    url_dibuang = 'tweet_url' in df.columns
+    if url_dibuang:
         df = df.drop(columns=['tweet_url'])
-        st.session_state['tweet_url_dibuang'] = True
-    else:
-        st.session_state['tweet_url_dibuang'] = False
-    return df, nama, cek
+    return df, nama, cek, url_dibuang
 
 
 # ==========================================================
-# HALAMAN: DATASET
+# TAB 1: DATA
 # ==========================================================
-def render_tab_data(df, nama, cek):
-    if st.session_state.get('tweet_url_dibuang'):
+def render_tab_data(df, nama, cek, url_dibuang):
+    if url_dibuang:
         st.warning("Kolom 'tweet_url' memuat nama akun, jadi disembunyikan. Sebaiknya dibuang dari berkas sebelum dikumpulkan.")
     waktu = pd.to_datetime(df['created_at'], errors='coerce', utc=True)
     st.write("### Ringkasan Data")
-    st.write(f"Jumlah data: {len(df):,} postingan · {df.shape[1]} kolom"
-             + (f" · {waktu.min():%Y-%m-%d} s.d. {waktu.max():%Y-%m-%d}" if waktu.notna().any() else ""))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Jumlah postingan", f"{len(df):,}")
+    c2.metric("Jumlah kolom", df.shape[1])
+    if waktu.notna().any():
+        c3.metric("Rentang tanggal", f"{waktu.min():%Y-%m-%d} s.d. {waktu.max():%Y-%m-%d}")
     st.caption(f"Sumber data: {nama}")
 
     with st.expander("Pemeriksaan kolom"):
         st.dataframe(cek, hide_index=True)
-        opsional = {'text_clean': 'clustering & word cloud', 'sentimen': 'halaman Sentimen', 'cluster': 'halaman Clustering',
-                    'retweet_count': 'regresi retweet & reply', 'reply_count': 'regresi retweet & reply',
+        opsional = {'text_clean': 'clustering & word cloud', 'sentimen': 'tab Sentimen', 'cluster': 'tab Clustering',
                     'query': 'sebaran per kata kunci'}
         hilang = {k: v for k, v in opsional.items() if k not in df.columns}
         if hilang:
@@ -411,28 +449,28 @@ def render_tab_data(df, nama, cek):
         n = len(df)
         d_s, k_s = siapkan_sentimen(df)
         d_c, k_c = siapkan_cluster(df)
-        r = hasil_regresi(df)
+        rr = baris_regresi(df)
         baris = [
             {'Analisis': 'Sentimen', 'Dipakai': 0 if d_s is None else n - k_s, 'Dikeluarkan': n if d_s is None else k_s,
              'Alasan': "kolom 'sentimen' tidak ada" if d_s is None else "label sentimen kosong/tidak valid"},
             {'Analisis': 'Clustering', 'Dipakai': 0 if d_c is None else n - k_c, 'Dikeluarkan': n if d_c is None else k_c,
              'Alasan': "kolom 'cluster' tidak ada" if d_c is None else "label cluster kosong"},
-            {'Analisis': 'Regresi', 'Dipakai': r.get('n_pakai', 0),
-             'Dikeluarkan': r['n_like_tidak_valid'] + r['n_teks_kosong'],
-             'Alasan': f"likes kosong/bukan angka/negatif ({r['n_like_tidak_valid']}) dan teks kosong ({r['n_teks_kosong']}); likes tidak diganti 0"},
+            {'Analisis': 'Regresi', 'Dipakai': rr['dipakai'],
+             'Dikeluarkan': rr['like_tidak_valid'] + rr['teks_kosong'],
+             'Alasan': f"likes kosong/bukan angka/negatif ({rr['like_tidak_valid']}) dan teks kosong "
+                       f"({rr['teks_kosong']}); likes tidak diganti 0"},
         ]
         st.dataframe(pd.DataFrame(baris), hide_index=True, width='stretch')
 
     with st.expander("Informasi pengambilan dan pembersihan data"):
         st.dataframe(pd.DataFrame(list(INFO_PENGAMBILAN.items()), columns=['Item', 'Keterangan']),
-                    hide_index=True, width='stretch')
+                     hide_index=True, width='stretch')
         tahap = baca_opsional(PATH_TAHAP)
         if tahap is None:
             st.info("Berkas jumlah_data_per_tahap.csv tidak ditemukan (opsional).")
         else:
             st.write("**Jumlah data pada setiap tahap pembersihan:**")
             st.dataframe(tahap, hide_index=True, width='stretch')
-    return df
 
 
 # ==========================================================
@@ -509,7 +547,7 @@ def render_tab_sentimen(df):
     st.write("### Ringkasan Pemeriksaan Manual")
     ev = baca_opsional(PATH_EVAL)
     if ev is None:
-        st.warning("Berkas datas/evaluasi_sentimen.csv tidak ditemukan.")
+        st.warning("Berkas evaluasi_sentimen.csv tidak ditemukan.")
         return
     ev.columns = ev.columns.str.strip().str.lower()
     if not {'label_manual', 'prediksi_model'}.issubset(ev.columns):
@@ -556,8 +594,8 @@ def render_tab_cluster(df):
 
     sw, nltk_ok = muat_stopwords()
     if not nltk_ok:
-        st.warning("Stopwords NLTK tidak tersedia (tidak ada internet?). Kata dominan dan peta bisa sedikit berbeda dari notebook. "
-                   "Letakkan stopwords.txt di folder datas/ sebagai cadangan.")
+        st.warning("Stopwords tidak tersedia (stopwords.txt tidak ada dan NLTK tidak dapat diunduh). Kata dominan dan "
+                   "peta bisa sedikit berbeda dari notebook. Letakkan stopwords.txt di folder datas/.")
     stop_cluster = tuple(sorted(w for w in sw if re.fullmatch(r'[a-z]{3,}', w)))
     d = d.reset_index(drop=True)
     koordinat, info, sil, tanpa_kata = analisis_cluster(
@@ -647,251 +685,143 @@ def render_tab_cluster(df):
 # ==========================================================
 # TAB 4: REGRESI
 # ==========================================================
-def gambar_heatmap(data_latih):
-    nama = {'jumlah_kata': 'Jumlah kata', 'jumlah_hashtag': 'Jumlah hashtag', 'like_count': 'Jumlah likes',
-            'retweet_count': 'Jumlah retweet', 'reply_count': 'Jumlah reply'}
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.6), constrained_layout=True)
-    gambar = None
-    for ax, (metode, judul) in zip(axes, [('pearson', 'Pearson (hubungan linear)'),
-                                          ('spearman', 'Spearman (hubungan peringkat)')]):
-        kor = data_latih.corr(method=metode).rename(index=nama, columns=nama)
-        gambar = ax.imshow(kor.values, cmap='RdBu_r', vmin=-1, vmax=1)
-        n = len(kor)
-        ax.set_xticks(range(n))
-        ax.set_yticks(range(n))
-        ax.set_xticklabels(kor.columns, rotation=20, ha='right')
-        ax.set_yticklabels(kor.index)
-        for i in range(n):
-            for j in range(n):
-                v = kor.values[i, j]
-                ax.text(j, i, 'n/a' if np.isnan(v) else f'{v:.2f}', ha='center', va='center', fontsize=11,
-                        color='white' if (not np.isnan(v) and abs(v) > 0.6) else '#2c2c2a')
-        ax.set_title(judul, fontsize=11)
-        ax.grid(False)
-    fig.colorbar(gambar, ax=axes, shrink=0.85, label='Koefisien korelasi')
-    fig.suptitle(f'Korelasi fitur dan likes (data latih, n = {len(data_latih)})', fontsize=12)
-    return fig
-
-
 def render_tab_regresi(df):
-    st.subheader("Regresi Linear: Jumlah Kata dan Hashtag → Jumlah Likes")
-    r = hasil_regresi(df)
-    if not r['ok']:
-        st.error(r['pesan'])
+    st.subheader("Regresi Linear: Memperkirakan Jumlah Likes")
+    reg = muat_regresi()
+    for c in reg['catatan']:
+        st.warning(c)
+    p = reg['p']
+    if p is None:
+        st.error("Hasil regresi tidak ditemukan. Jalankan sel ekspor di notebook, lalu letakkan model_regresi.joblib "
+                 "(atau parameter_model.json dan prediksi_data_uji.csv) di folder datas/.")
         return
 
-    st.caption(f"Fitur dihitung dari teks asli. Data latih {r['n_latih']} baris (80%), data uji {r['n_uji']} baris (20%), "
-               f"random_state = {RANDOM_STATE}. Model hanya belajar dari data latih; semua angka di bawah dari data uji.")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("MAE", f"{r['mae']:.2f} likes")
-    m2.metric("R²", f"{r['r2']:.3f}")
-    m3.metric("MAE tebak rata-rata", f"{r['mae_rata']:.2f}")
-    m4.metric("MAE tebak median", f"{r['mae_median']:.2f}")
-    st.code(f"likes ≈ {r['intercept']:.2f} + ({r['coef'][0]:.3f} × jumlah_kata) + ({r['coef'][1]:.3f} × jumlah_hashtag)",
-            language=None)
-    with st.expander("Statistik fitur dan sebaran hashtag"):
-        st.dataframe(r['deskripsi'], width='stretch')
-        st.write("**Sebaran jumlah hashtag (seluruh data valid):**")
-        st.dataframe(r['sebaran_hashtag'].rename_axis('Jumlah hashtag').reset_index(name='Jumlah postingan'),
-                     hide_index=True)
-        st.caption(f"Postingan dengan ≥ 1 hashtag di data latih: {r['n_hashtag_latih']} dari {r['n_latih']}. "
-                   "Fitur hashtag hampir konstan (kebanyakan bernilai 0), sehingga hanya sedikit membantu prediksi.")
+    meta, sel, u, dasar = p['meta'], p['seleksi_fitur'], p['model_utama'], p['pembanding_dasar']
+    model_u = reg['objek'].get('utama')
+    model_k = reg['objek'].get('ketentuan')
 
-    # grafik aktual vs prediksi
-    st.write("### Likes Aktual vs Prediksi (Data Uji)")
-    kiri, kanan = st.columns([1.1, 1])
-    with kiri:
-        log_skala = st.checkbox("Skala logaritmik (symlog), agar titik tidak menumpuk", value=False)
-        y_te, y_pr = r['y_test'], r['y_pred']
-        fig, ax = plt.subplots(figsize=(6, 5.5))
-        ax.scatter(y_te, y_pr, s=22, alpha=0.7, color='#2a78d6', edgecolors='white', linewidths=0.5,
-                   label='Postingan (data uji)')
-        batas = [min(y_te.min(), y_pr.min()), max(y_te.max(), y_pr.max())]
-        ax.plot(batas, batas, linestyle='--', linewidth=1.5, color='#52514e', label='Prediksi sempurna (aktual = prediksi)')
-        ax.axhline(0, color='#e34948', linewidth=1, alpha=0.6, label='Likes = 0 (di bawahnya = prediksi negatif)')
-        if log_skala:
-            ax.set_xscale('symlog')
-            ax.set_yscale('symlog')
-        ax.set_xlabel('Likes aktual')
-        ax.set_ylabel('Likes prediksi')
-        ax.set_title('Likes Aktual vs Prediksi (data uji)')
-        ax.legend(fontsize=8)
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
-    with kanan:
-        tabel = r['X_test'].copy()
-        tabel['like_aktual'] = r['y_test']
-        tabel['like_prediksi'] = r['y_pred'].round(2)
-        st.write("**Tabel data uji:**")
-        st.dataframe(tabel, width='stretch', height=380)
+    st.caption(f"Model dilatih di notebook pada dataset yang sama: data latih {meta['n_latih']} baris (80%), data uji "
+               f"{meta['n_uji']} baris (20%), random_state = {meta['random_state']}. Semua angka evaluasi dari data uji. "
+               "Hasil regresi tidak dihitung ulang untuk CSV yang diunggah.")
+    n_model = meta['n_latih'] + meta['n_uji']
+    if len(df) != n_model:
+        st.warning(f"Jumlah baris data di aplikasi ({len(df)}) berbeda dari data pelatihan model ({n_model}). "
+                   "Hasil regresi di bawah berasal dari notebook dan mungkin tidak sesuai dengan data ini.")
 
-    # interpretasi
-    st.write("### Interpretasi")
-    st.markdown(
-        f"- **MAE {r['mae']:.2f}**: rata-rata, perkiraan model meleset sekitar {r['mae']:.0f} likes dari jumlah likes sebenarnya "
-        f"(satuan sama dengan likes). Median likes data uji hanya {r['median_uji']:.0f}, jadi angka ini perlu dibaca "
-        f"terhadap sebaran data dan pembanding di atas.\n"
-        f"- **R² {r['r2']:.3f}**: 1 berarti sempurna, 0 berarti sama baiknya dengan menebak rata-rata, dan **negatif berarti "
-        f"lebih buruk daripada menebak rata-rata**.\n"
-        f"- **Keterbatasan**: hanya dua fitur dan hanya {r['persen_berhashtag']:.1f}% postingan yang memakai hashtag. "
-        f"Likes juga dipengaruhi usia postingan, jangkauan akun, dan isi pesan yang tidak ada dalam model."
-    )
-    if r['r2'] < 0:
-        st.warning("R² negatif: pada data uji, model dua fitur ini tidak lebih baik daripada menebak rata-rata likes.")
-    if r['mae_median'] < r['mae']:
-        st.info(f"Menebak median likes (MAE {r['mae_median']:.2f}) lebih akurat daripada model ({r['mae']:.2f}). "
-                "Sebaran likes sangat miring: sebagian besar postingan hanya mendapat sedikit likes.")
-    st.caption(f"Prediksi negatif pada data uji: {r['n_negatif']} dari {r['n_uji']}. Likes negatif tidak bermakna "
-               "dan menunjukkan keterbatasan regresi linear.")
-    with st.expander("Lima postingan dengan selisih prediksi terbesar (data uji)"):
-        sel = r['X_test'].copy()
-        sel['aktual'] = r['y_test']
-        sel['prediksi'] = r['y_pred'].round(1)
-        sel['selisih'] = (sel['aktual'] - sel['prediksi']).abs()
-        sel['text'] = [t[:200].replace('\n', ' ') for t in r['teks_uji']]
-        st.dataframe(sel.sort_values('selisih', ascending=False).head(5), hide_index=True, width='stretch')
-        st.caption("Selisih terbesar umumnya berasal dari postingan dengan likes sangat tinggi, yang tidak dapat "
-                   "dijelaskan oleh jumlah kata dan hashtag.")
-
-    with st.expander("Heatmap korelasi fitur dan likes (data latih)"):
-        fig = gambar_heatmap(r['data_latih'])
-        st.pyplot(fig)
-        plt.close(fig)
-        st.caption("Pearson mengukur hubungan linear dengan nilai asli. Spearman memakai peringkat sehingga lebih tahan "
-                   "terhadap postingan viral. Korelasi tidak menunjukkan sebab-akibat.")
-
-    if r['eks'] is not None:
-        st.info(f"Model tambahan **retweet + reply → likes** (MAE {r['eks']['mae']:.2f}, R² {r['eks']['r2']:.3f}) "
-                "tersedia di menu sidebar **Regresi: Retweet & Reply**.")
-
-    # formulir estimasi (model utama dua fitur)
-    st.write("### Estimasi Likes")
-    with st.form("form_estimasi"):
-        f1, f2 = st.columns(2)
-        w_in = f1.number_input("Jumlah kata", min_value=1, max_value=300,
-                               value=int(min(max(r['kata_median'], 1), 300)), step=1)
-        h_in = f2.number_input("Jumlah hashtag", min_value=0, max_value=50, value=0, step=1)
-        kirim = st.form_submit_button("Hitung estimasi")
-    if kirim:
-        est = float(r['model'].predict(pd.DataFrame([[w_in, h_in]], columns=FITUR))[0])
-        st.metric("Estimasi likes (nilai mentah model)", f"{est:,.1f}")
-        if est < 0:
-            st.warning("Estimasi negatif tidak bermakna sebagai jumlah likes. Ini menunjukkan keterbatasan model linear dua fitur.")
-        if w_in > r['kata_max'] or h_in > r['hashtag_max']:
-            st.warning(f"Masukan di luar rentang data (maksimum {r['kata_max']} kata dan {r['hashtag_max']} hashtag); "
-                       "estimasi tidak andal.")
-        st.caption(f"Sebagai pembanding: median likes seluruh data {r['median_semua']:.0f}, sedangkan model memperkirakan "
-                   f"sekitar {r['est_tipikal']:.0f} likes untuk postingan tipikal ({r['kata_median']} kata, tanpa hashtag). "
-                   "Estimasi ini hanya ilustrasi, bukan prediksi yang dapat diandalkan.")
-
-
-# ==========================================================
-# HALAMAN: REGRESI RETWEET + REPLY (model tambahan notebook)
-# ==========================================================
-def render_tab_regresi_engagement(df):
-    st.subheader("Regresi Linear: Jumlah Retweet dan Reply → Jumlah Likes")
-    r = hasil_regresi(df)
-    if not r['ok']:
-        st.error(r['pesan'])
-        return
-    e = r['eks']
-    if e is None:
-        st.error("Kolom 'retweet_count' dan 'reply_count' tidak ada atau berisi nilai kosong/bukan angka, "
-                 "sehingga model ini tidak dapat dilatih.")
-        return
-
-    st.caption(f"Sama dengan model tambahan (non-log) di notebook: skala asli, baris data latih ({r['n_latih']}) dan "
-               f"data uji ({r['n_uji']}) identik dengan model jumlah kata & hashtag (80/20, random_state = {RANDOM_STATE}). "
-               "Model hanya belajar dari data latih; semua angka di bawah dari data uji.")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("MAE", f"{e['mae']:.2f} likes")
-    m2.metric("R²", f"{e['r2']:.3f}")
-    m3.metric("MAE tebak rata-rata", f"{r['mae_rata']:.2f}")
-    m4.metric("MAE tebak median", f"{r['mae_median']:.2f}")
-    st.code(f"likes ≈ {e['intercept']:.2f} + ({e['coef'][0]:.3f} × retweet) + ({e['coef'][1]:.3f} × reply)",
-            language=None)
-
-    st.write("### Perbandingan dengan Model Jumlah Kata & Hashtag")
+    # 1) pemilihan fitur
+    st.write("### Pemilihan Fitur (Korelasi Linear)")
+    st.caption("Korelasi Pearson dihitung hanya dari data latih, sebelum fitur dipilih, supaya data uji tidak ikut "
+               "memengaruhi pilihan. Dua variabel dengan |r| tertinggi dipilih sebagai fitur.")
+    kor = sel['korelasi_dengan_likes']
     st.dataframe(pd.DataFrame({
-        'Model': ['Jumlah kata + hashtag', 'Retweet + reply', 'Tebak rata-rata', 'Tebak median'],
-        'MAE (likes)': [round(r['mae'], 2), round(e['mae'], 2), round(r['mae_rata'], 2), round(r['mae_median'], 2)],
-        'R²': [round(r['r2'], 3), round(e['r2'], 3), None, None],
-        'Prediksi negatif': [r['n_negatif'], e['n_negatif'], None, None],
+        'Variabel': [NAMA_FITUR.get(k, k) for k in kor],
+        'Pearson (r) dengan likes': [round(v, 3) for v in kor.values()],
+        'Dipilih': ['ya' if k in u['fitur'] else '' for k in kor],
     }), hide_index=True, width='stretch')
+    fig = gambar_heatmap_param(sel)
+    st.pyplot(fig)
+    plt.close(fig)
+    st.caption("Pegangan membaca |r| (konvensi umum): di bawah 0,1 diabaikan; 0,1–0,3 lemah; 0,3–0,5 sedang; "
+               "di atas 0,5 kuat. Baca baris atau kolom 'Jumlah likes' untuk hubungan dengan likes; angka lain adalah "
+               "korelasi antar-variabel. Korelasi tidak menunjukkan sebab-akibat.")
+    st.success("Fitur terpilih: " + ", ".join(u['label_fitur']))
 
-    with st.expander("Statistik fitur retweet, reply, dan likes"):
-        st.dataframe(e['deskripsi'], width='stretch')
+    # 2) evaluasi
+    st.write("### Model dan Evaluasi")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("MAE", f"{u['mae']:.2f} likes")
+    m2.metric("R²", f"{u['r2']:.3f}")
+    m3.metric("MAE tebak rata-rata", f"{dasar['mae_tebak_rata']:.2f}")
+    m4.metric("MAE tebak median", f"{dasar['mae_tebak_median']:.2f}")
+    st.code(f"likes ≈ {u['intercept']:.2f}" + "".join(
+        f" + ({c:.3f} × {f})" for c, f in zip(u['koefisien'], u['fitur'])), language=None)
+    st.caption(f"Prediksi negatif pada data uji: {u['n_negatif']} dari {meta['n_uji']}.")
 
-    # grafik aktual vs prediksi
-    st.write("### Likes Aktual vs Prediksi (Data Uji)")
-    kiri, kanan = st.columns([1.1, 1])
-    with kiri:
-        fig, ax = plt.subplots(figsize=(6, 5.5))
-        ax.scatter(r['y_test'], e['y_pred'], s=22, alpha=0.7, color='#eb6834',
-                   edgecolors='white', linewidths=0.5, label='Postingan (data uji)')
-        batas = max(r['y_test'].max(), e['y_pred'].max())
-        ax.plot([0, batas], [0, batas], '--', color='#52514e', label='Prediksi sempurna')
-        ax.set_xscale('symlog'); ax.set_yscale('symlog')
-        ax.set_xlabel('Likes aktual'); ax.set_ylabel('Likes prediksi')
-        ax.set_title('Retweet + reply → likes (skala symlog)')
-        ax.legend(fontsize=8)
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
-    with kanan:
-        tabel = e['X_test'].copy()
-        tabel['like_aktual'] = r['y_test']
-        tabel['like_prediksi'] = e['y_pred'].round(2)
-        st.write("**Tabel data uji:**")
-        st.dataframe(tabel, width='stretch', height=380)
+    # 3) grafik dan tabel data uji
+    uji = reg['uji']
+    if uji is None or 'prediksi_utama' not in uji.columns:
+        st.info("Data prediksi uji tidak tersedia (prediksi_data_uji.csv), sehingga grafik aktual vs prediksi tidak dapat ditampilkan.")
+    else:
+        uji = uji.copy()
+        st.write("### Likes Aktual vs Prediksi (Data Uji)")
+        kiri, kanan = st.columns([1.1, 1])
+        with kiri:
+            log_skala = st.checkbox("Skala logaritmik (symlog), agar titik tidak menumpuk", value=True)
+            fig, ax = plt.subplots(figsize=(6, 5.5))
+            ax.scatter(uji['like_aktual'], uji['prediksi_utama'], s=22, alpha=0.7, color='#2a78d6',
+                       edgecolors='white', linewidths=0.5, label='Postingan (data uji)')
+            batas = [min(uji['like_aktual'].min(), uji['prediksi_utama'].min()),
+                     max(uji['like_aktual'].max(), uji['prediksi_utama'].max())]
+            ax.plot(batas, batas, '--', color='#52514e', linewidth=1.5, label='Prediksi sempurna (aktual = prediksi)')
+            ax.axhline(0, color='#e34948', linewidth=1, alpha=0.6, label='Likes = 0 (di bawahnya = prediksi negatif)')
+            if log_skala:
+                ax.set_xscale('symlog')
+                ax.set_yscale('symlog')
+            ax.set_xlabel('Likes aktual')
+            ax.set_ylabel('Likes prediksi')
+            ax.set_title('Likes aktual vs prediksi (data uji)')
+            ax.legend(fontsize=8)
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+        with kanan:
+            st.write("**Tabel data uji:**")
+            st.dataframe(uji.drop(columns=['text'], errors='ignore').round(2), width='stretch', height=380)
 
-    # interpretasi
+        with st.expander("Lima postingan dengan selisih prediksi terbesar (data uji)"):
+            t = uji.copy()
+            t['selisih'] = (t['like_aktual'] - t['prediksi_utama']).abs().round(1)
+            st.dataframe(t.sort_values('selisih', ascending=False).head(5), hide_index=True, width='stretch')
+            st.caption("Selisih terbesar umumnya berasal dari postingan dengan likes sangat tinggi.")
+
+    # 4) perbandingan model
+    pembanding = [{'Model': 'Terpilih: ' + ', '.join(u['label_fitur']), 'MAE': u['mae'], 'R²': u['r2'],
+                   'Prediksi negatif': u['n_negatif']}]
+    if 'model_ketentuan' in p:
+        k = p['model_ketentuan']
+        pembanding.append({'Model': 'Fitur ketentuan tugas: ' + ', '.join(k['label_fitur']), 'MAE': k['mae'],
+                           'R²': k['r2'], 'Prediksi negatif': k['n_negatif']})
+    pembanding += [{'Model': 'Tebak rata-rata', 'MAE': dasar['mae_tebak_rata'], 'R²': None, 'Prediksi negatif': None},
+                   {'Model': 'Tebak median', 'MAE': dasar['mae_tebak_median'], 'R²': None, 'Prediksi negatif': None}]
+    st.write("### Perbandingan Model")
+    st.dataframe(pd.DataFrame(pembanding).round(3), hide_index=True, width='stretch')
+
+    # 5) interpretasi
     st.write("### Interpretasi")
-    catatan = f"Prediksi negatif: {e['n_negatif']} dari {r['n_uji']}."
-    if e['intercept'] > r['median_uji'] and min(e['coef']) >= 0:
-        catatan += (f" Karena koefisiennya tidak negatif, prediksi tidak pernah di bawah ±{e['intercept']:.1f} likes, "
-                    f"padahal median likes data uji {r['median_uji']:.0f}; postingan yang sepi cenderung "
-                    "diprediksi terlalu tinggi.")
-    banding = "lebih kecil" if e['mae'] < r['mae_median'] else "tidak lebih kecil"
-    arti_r2 = ("sebagian besar variasi likes di data uji ikut dijelaskan oleh retweet dan reply" if e['r2'] >= 0.5
-               else "model lebih buruk daripada menebak rata-rata" if e['r2'] < 0
-               else "hanya sebagian variasi likes yang dijelaskan oleh retweet dan reply")
     st.markdown(
-        f"- **MAE {e['mae']:.2f}**: rata-rata perkiraan meleset sekitar {e['mae']:.0f} likes, {banding} daripada "
-        f"menebak median ({r['mae_median']:.2f}); model jumlah kata & hashtag MAE {r['mae']:.2f}.\n"
-        f"- **R² {e['r2']:.3f}**: {arti_r2}.\n"
-        f"- Setiap tambahan 1 retweet berasosiasi dengan sekitar {e['coef'][0]:+.2f} likes, dan 1 reply dengan "
-        f"sekitar {e['coef'][1]:+.2f} likes (dengan fitur lain tetap)."
+        f"- **MAE {u['mae']:.2f}**: rata-rata, perkiraan model meleset sekitar {u['mae']:.0f} likes dari jumlah likes "
+        f"sebenarnya (satuan sama dengan likes). Median likes data uji {meta['median_likes_uji']:.0f}.\n"
+        f"- **R² {u['r2']:.3f}**: 1 berarti sempurna, 0 berarti sama baiknya dengan menebak rata-rata, dan **negatif "
+        f"berarti lebih buruk daripada menebak rata-rata**.\n"
+        f"- **Keterbatasan**: likes juga dipengaruhi jangkauan akun dan isi pesan yang tidak ada dalam model, dan "
+        f"sebaran likes sangat miring (median seluruh data {meta['median_likes_semua']:.0f})."
     )
-    st.caption(catatan)
-    st.warning("Retweet dan reply baru diketahui setelah postingan mendapat respons, sama seperti likes. "
-               "Model ini menggambarkan hubungan antar-metrik engagement, bukan prediksi likes sebelum postingan terbit.")
+    if u['r2'] < 0:
+        st.warning("R² negatif: pada data uji, model ini tidak lebih baik daripada menebak rata-rata likes.")
+    elif dasar['mae_tebak_median'] < u['mae']:
+        st.info(f"Menebak median likes (MAE {dasar['mae_tebak_median']:.2f}) lebih akurat daripada model ({u['mae']:.2f}).")
+    if u['metrik_respons']:
+        st.warning("Fitur terpilih adalah metrik respons yang terukur bersamaan dengan likes. Model ini menggambarkan "
+                   "hubungan antar-metrik engagement, bukan prediksi likes sebelum postingan terbit.")
+    st.caption("Regresi linear dapat menghasilkan estimasi negatif; nilai itu tidak bermakna sebagai jumlah likes dan "
+               "menunjukkan keterbatasan model.")
 
-    with st.expander("Heatmap korelasi retweet, reply, dan likes (data latih)"):
-        fig = gambar_heatmap(e['data_latih'])
-        st.pyplot(fig)
-        plt.close(fig)
-        st.caption("Korelasi tidak menunjukkan sebab-akibat.")
+    # 6) formulir estimasi
+    st.write("### Estimasi Likes")
+    form_estimasi(u, model_u, 'utama')
 
-    # formulir estimasi
-    st.write("### Estimasi Likes dari Retweet dan Reply")
-    with st.form("form_estimasi_engagement"):
-        f1, f2 = st.columns(2)
-        rt_in = f1.number_input("Jumlah retweet", min_value=0, max_value=100000,
-                                value=int(e['median']['retweet_count']), step=1)
-        rp_in = f2.number_input("Jumlah reply", min_value=0, max_value=10000,
-                                value=int(e['median']['reply_count']), step=1)
-        kirim = st.form_submit_button("Hitung estimasi")
-    if kirim:
-        est = float(e['model'].predict(pd.DataFrame([[rt_in, rp_in]], columns=FITUR_ENG))[0])
-        st.metric("Estimasi likes (nilai mentah model)", f"{est:,.1f}")
-        if est < 0:
-            st.warning("Estimasi negatif tidak bermakna sebagai jumlah likes.")
-        if rt_in > e['maks']['retweet_count'] or rp_in > e['maks']['reply_count']:
-            st.warning(f"Masukan di luar rentang data (maksimum {e['maks']['retweet_count']} retweet dan "
-                       f"{e['maks']['reply_count']} reply); estimasi tidak andal.")
-        st.caption(f"Pembanding: median likes seluruh data {r['median_semua']:.0f}. Estimasi ini hanya ilustrasi.")
+    # 7) model sesuai ketentuan tugas (pembanding)
+    if 'model_ketentuan' in p:
+        k = p['model_ketentuan']
+        with st.expander("Model dengan fitur ketentuan tugas (jumlah kata + hashtag), sebagai pembanding"):
+            k1, k2 = st.columns(2)
+            k1.metric("MAE", f"{k['mae']:.2f} likes")
+            k2.metric("R²", f"{k['r2']:.3f}")
+            st.code(f"likes ≈ {k['intercept']:.2f}" + "".join(
+                f" + ({c:.3f} × {f})" for c, f in zip(k['koefisien'], k['fitur'])), language=None)
+            st.caption("Dilatih dengan pembagian data yang sama. Prediksi negatif: "
+                       f"{k['n_negatif']} dari {meta['n_uji']}.")
+            form_estimasi(k, model_k, 'ketentuan')
 
 
 # ==========================================================
@@ -903,11 +833,11 @@ def render_temuan(df):
 
     d, _ = siapkan_sentimen(df)
     if d is not None and len(d):
-        p = (d['sentimen'].value_counts(normalize=True) * 100).reindex(URUTAN_SENTIMEN, fill_value=0)
-        urut = p.sort_values(ascending=False)
+        p_s = (d['sentimen'].value_counts(normalize=True) * 100).reindex(URUTAN_SENTIMEN, fill_value=0)
+        urut = p_s.sort_values(ascending=False)
         kal = (f"**Sentimen.** Dari {len(d)} postingan, kategori terbanyak adalah *{urut.index[0]}* "
-               f"({urut.iloc[0]:.1f}%). Sebaran: positif {p['positif']:.1f}%, netral {p['netral']:.1f}%, "
-               f"negatif {p['negatif']:.1f}%.")
+               f"({urut.iloc[0]:.1f}%). Sebaran: positif {p_s['positif']:.1f}%, netral {p_s['netral']:.1f}%, "
+               f"negatif {p_s['negatif']:.1f}%.")
         ev = ringkas_evaluasi()
         if ev:
             kal += (f" Pada pemeriksaan manual {ev['n']} sampel, {ev['k']} sesuai ({ev['k'] / ev['n'] * 100:.0f}%); "
@@ -932,16 +862,21 @@ def render_temuan(df):
             kalimat += "; cluster saling tumpang tindih bila nilainya mendekati 0."
         temuan.append(kalimat)
 
-    r = hasil_regresi(df)
-    if r['ok']:
-        arah = ("model lebih buruk daripada menebak rata-rata" if r['r2'] < 0
-                else "model hanya menjelaskan sebagian kecil variasi likes")
-        kal_reg = (f"**Regresi.** Dengan jumlah kata dan hashtag, MAE {r['mae']:.1f} likes dan R² {r['r2']:.3f} "
-                   f"({arah}). Menebak median likes menghasilkan MAE {r['mae_median']:.1f}.")
-        if r['eks'] is not None:
-            kal_reg += (f" Pada analisis tambahan, retweet dan reply (terukur bersamaan dengan likes) memberi MAE "
-                        f"{r['eks']['mae']:.1f} dan R² {r['eks']['r2']:.3f}; ini hubungan antar-metrik engagement, "
-                        "bukan prediksi sebelum posting.")
+    reg = muat_regresi()
+    p = reg['p']
+    if p:
+        u, dasar = p['model_utama'], p['pembanding_dasar']
+        n_kand = len(p['seleksi_fitur']['korelasi_dengan_likes'])
+        kal_reg = (f"**Regresi.** Dari {n_kand} variabel kandidat, dua dengan korelasi Pearson tertinggi terhadap likes "
+                   f"({', '.join(u['label_fitur'])}) dipilih sebagai fitur. Pada data uji, modelnya mencapai MAE "
+                   f"{u['mae']:.1f} likes dan R² {u['r2']:.3f}; menebak median likes menghasilkan MAE "
+                   f"{dasar['mae_tebak_median']:.1f}.")
+        if u['metrik_respons']:
+            kal_reg += (" Fitur ini terukur bersamaan dengan likes, sehingga model menggambarkan hubungan antar-metrik "
+                        "engagement, bukan prediksi sebelum posting.")
+        if 'model_ketentuan' in p:
+            kal_reg += (f" Sebagai pembanding, model jumlah kata dan hashtag hanya mencapai R² "
+                        f"{p['model_ketentuan']['r2']:.3f}.")
         temuan.append(kal_reg)
 
     if temuan:
@@ -953,67 +888,55 @@ def render_temuan(df):
 
     waktu = pd.to_datetime(df['created_at'], errors='coerce', utc=True)
     periode = f"{waktu.min():%Y-%m-%d} s.d. {waktu.max():%Y-%m-%d}" if waktu.notna().any() else "periode tidak diketahui"
-    hashtag_info = f" Hanya {r['persen_berhashtag']:.1f}% postingan yang memakai hashtag." if r['ok'] else ""
+    if p and p['model_utama']['metrik_respons']:
+        k2 = (f"fitur terpilih ({', '.join(p['model_utama']['label_fitur'])}) terukur bersamaan dengan likes, sehingga "
+              "model menggambarkan hubungan antar-metrik engagement, bukan prediksi sebelum posting. Jangkauan akun dan "
+              "isi pesan tidak ada dalam model, dan sebaran likes sangat miring.")
+    else:
+        k2 = "likes dipengaruhi usia postingan, jangkauan akun, dan isi pesan yang tidak ada dalam model, dan sebaran likes sangat miring."
+    r_kata = p['seleksi_fitur']['korelasi_dengan_likes'].get('jumlah_kata') if p else None
+    if r_kata is not None:
+        k2 += f" Ciri teks sederhana seperti jumlah kata hampir tidak berkorelasi dengan likes (r = {r_kata:.2f})."
     st.write("### 2 Keterbatasan")
     st.markdown(
         f"1. **Data sampel.** Data berasal dari pencarian kata kunci tertentu ({periode}), bukan seluruh percakapan di X, "
         "sehingga tidak mewakili opini masyarakat. Sentimen diberi label oleh model pra-latih dan hanya diperiksa manual pada "
         "sejumlah kecil sampel; sebagian postingan tidak relevan atau berbahasa lain masih mungkin ada.\n"
-        "2. **Model likes sederhana.** Likes dipengaruhi usia postingan, jangkauan akun, dan isi pesan yang tidak ada "
-        f"dalam model, dan sebaran likes sangat miring.{hashtag_info}"
+        f"2. **Model likes sederhana.** Pada model regresi, {k2}"
     )
-
-
-# ==========================================================
-# HALAMAN: TENTANG
-# ==========================================================
-def render_tentang():
-    st.subheader("Tentang")
-    st.write(
-        "Aplikasi ini menampilkan hasil analisis postingan X tentang AI dan profesi kreatif. "
-        "Alur: crawling, pembersihan data, klasifikasi sentimen (IndoBERT), clustering TF-IDF + K-Means (K = 3), "
-        "dan regresi linear untuk jumlah likes. Proses berat dijalankan di notebook; aplikasi membaca hasilnya "
-        "dari folder datas/."
-    )
-    st.write("### Informasi Pengambilan Data")
-    st.dataframe(pd.DataFrame(list(INFO_PENGAMBILAN.items()), columns=['Item', 'Keterangan']),
-                 hide_index=True, width='stretch')
 
 
 # ==========================================================
 # TATA LETAK UTAMA
 # ==========================================================
-MENU = ["Dataset", "Sentimen", "Clustering", "Regresi: Kata & Hashtag",
-        "Regresi: Retweet & Reply", "Temuan & Keterbatasan", "Tentang"]
-HALAMAN = {
-    "Sentimen": render_tab_sentimen,
-    "Clustering": render_tab_cluster,
-    "Regresi: Kata & Hashtag": render_tab_regresi,
-    "Regresi: Retweet & Reply": render_tab_regresi_engagement,
-    "Temuan & Keterbatasan": render_temuan,
-}
-
-
 def main():
     st.title("Dashboard Analisis AI pada Profesi Kreatif")
     st.caption("Analisis sentimen, clustering, dan regresi linear pada postingan X")
 
-    choice = st.sidebar.selectbox("Menu", MENU, key='menu')
+    menu = ["Data", "Sentimen", "Clustering", "Regresi"]
+    choice = st.sidebar.selectbox("Menu", menu)
 
-    if choice == "Tentang":
-        render_tentang()
-        return
-    if choice == "Dataset":
-        st.subheader("Dataset")
+    if choice == "Data":
         widget_unggah()
-
-    data, nama_berkas, tabel_cek = muat_data()
-    if data is None:
-        st.info("Muat data yang valid terlebih dahulu di halaman Dataset.")
-    elif choice == "Dataset":
-        render_tab_data(data, nama_berkas, tabel_cek)
+        data, nama_berkas, tabel_cek, url_dibuang = muat_data()
+        if data is not None:
+            render_tab_data(data, nama_berkas, tabel_cek, url_dibuang)
     else:
-        HALAMAN[choice](data)
+        data, nama_berkas, tabel_cek, url_dibuang = muat_data()
+        if data is None:
+            st.info("Muat data yang valid di menu Data terlebih dahulu.")
+            return
+
+        if choice == "Sentimen":
+            render_tab_sentimen(data)
+        elif choice == "Clustering":
+            render_tab_cluster(data)
+        elif choice == "Regresi":
+            render_tab_regresi(data)
+
+    if data is not None:
+        st.divider()
+        render_temuan(data)
 
 
 if __name__ == "__main__":
