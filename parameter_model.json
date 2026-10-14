@@ -1,0 +1,36 @@
+{
+  "model_utama": {
+    "fitur": [
+      "jumlah_kata",
+      "jumlah_hashtag"
+    ],
+    "intercept": 508.6111624137541,
+    "koefisien": [
+      -9.13399705039907,
+      -45.9493404147147
+    ],
+    "rentang": {
+      "jumlah_kata": 58,
+      "jumlah_hashtag": 14
+    },
+    "mae": 217.9109321696503,
+    "r2": -0.4487370396970294
+  },
+  "model_tambahan": {
+    "fitur": [
+      "retweet_count",
+      "reply_count"
+    ],
+    "intercept": 14.599969338252947,
+    "koefisien": [
+      4.959438265881986,
+      8.266765137713044
+    ],
+    "rentang": {
+      "retweet_count": 8534,
+      "reply_count": 109
+    },
+    "mae": 48.2966015919912,
+    "r2": 0.6726593224943087
+  }
+}

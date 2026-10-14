@@ -1,0 +1,12 @@
+Tahap,Jumlah data,Berkurang,Keterangan
+1. Data mentah (gabungan semua query),1720,0,6 file query
+2. Buang duplikat,1686,34,berdasarkan kolom id
+3. Saring bahasa,1622,64,lang = 'in' (Bahasa Indonesia)
+4. Saring periode,1490,132,2025-01-01 s.d. 2026-10-11
+5. Saring relevansi,1287,203,memuat kata AI dan kata profesi kreatif
+6. Buang promosi,1286,1,frasa kuat (semua) + frasa lemah (non-balasan)
+7. Buang teks kosong,1286,0,
+8. Buang likes tidak valid,1286,0,"kosong/bukan angka/negatif dibuang, tidak diganti 0"
+9. Buang yang kosong setelah dibersihkan,1286,0,
+10. Buang duplikat isi,1276,10,text_clean sama / 80 karakter awal sama
+11. Buang tidak relevan (hasil audit),1270,6,6 dari 30 sampel audit
