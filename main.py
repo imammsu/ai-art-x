@@ -423,15 +423,15 @@ def render_tab_data(df, nama, cek):
         ]
         st.dataframe(pd.DataFrame(baris), hide_index=True, width='stretch')
 
-        with st.expander("Informasi pengambilan dan pembersihan data"):
-            st.dataframe(pd.DataFrame(list(INFO_PENGAMBILAN.items()), columns=['Item', 'Keterangan']),
-                        hide_index=True, width='stretch')
-            tahap = baca_opsional(PATH_TAHAP)
-            if tahap is None:
-                st.info("Berkas jumlah_data_per_tahap.csv tidak ditemukan (opsional).")
-            else:
-                st.write("**Jumlah data pada setiap tahap pembersihan:**")
-                st.dataframe(tahap, hide_index=True, width='stretch')
+    with st.expander("Informasi pengambilan dan pembersihan data"):
+        st.dataframe(pd.DataFrame(list(INFO_PENGAMBILAN.items()), columns=['Item', 'Keterangan']),
+                    hide_index=True, width='stretch')
+        tahap = baca_opsional(PATH_TAHAP)
+        if tahap is None:
+            st.info("Berkas jumlah_data_per_tahap.csv tidak ditemukan (opsional).")
+        else:
+            st.write("**Jumlah data pada setiap tahap pembersihan:**")
+            st.dataframe(tahap, hide_index=True, width='stretch')
     return df
 
 
@@ -861,8 +861,8 @@ def render_tab_regresi_engagement(df):
         f"- **MAE {e['mae']:.2f}**: rata-rata perkiraan meleset sekitar {e['mae']:.0f} likes, {banding} daripada "
         f"menebak median ({r['mae_median']:.2f}); model jumlah kata & hashtag MAE {r['mae']:.2f}.\n"
         f"- **R² {e['r2']:.3f}**: {arti_r2}.\n"
-        f"- Setiap tambahan 1 retweet berasosiasi dengan ±{e['coef'][0]:.2f} likes, dan 1 reply dengan "
-        f"±{e['coef'][1]:.2f} likes (dengan fitur lain tetap)."
+        f"- Setiap tambahan 1 retweet berasosiasi dengan sekitar {e['coef'][0]:+.2f} likes, dan 1 reply dengan "
+        f"sekitar {e['coef'][1]:+.2f} likes (dengan fitur lain tetap)."
     )
     st.caption(catatan)
     st.warning("Retweet dan reply baru diketahui setelah postingan mendapat respons, sama seperti likes. "
